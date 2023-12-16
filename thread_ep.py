@@ -7,6 +7,7 @@ import string
 import serial
 from queue import Queue
 
+time.sleep(10)
 # 直连模式下，机器人默认 IP 地址为 192.168.2.1, 控制命令端口号为 40923
 # USB模式下，机器人默认 IP 地址为 192.168.42.2, 控制命令端口号为 40923
 
@@ -74,6 +75,16 @@ class UI:
         self.mode = mode
         self.is_setting = False
 
+class AIData:
+    def __init__(self, raw):
+        # substr = raw[21:-1]   # 消息推送
+        # data_str_list = substr.split(' ')
+        # self.pitch = float(data_str_list[0])
+        # self.yaw = float(data_str_list[1])
+        self.raw = raw
+    def print_data(self):
+        print(f"raw:{self.raw}")
+
 # 创建两个锁对象
 lock = threading.Lock()
 send_recv_lock = threading.Lock()
@@ -107,6 +118,7 @@ block_skill = 0
 is_blocked_man = False
 is_blocked_data = False
 is_blocked_blaster = True
+is_man_cum = False
 blaster_flag_lock = threading.Lock()
 
 # 线程1：接收数据
@@ -131,6 +143,8 @@ def thread1_func():
             data1.mouse_x = (data1.mouse_x + data0.mouse_x) / 2
             data1.mouse_y = (data1.mouse_y + data0.mouse_y) / 2
             # #按键技能部分
+            if data1.mouse_press == 2:
+                is_man_cum = True
             if 9 in data1.keys and 9 not in data0.keys:   #Z键    云台旋转180°
                 block_skill = 1
             if 70 in data1.keys and 70 not in data0.keys:
@@ -211,27 +225,30 @@ def thread3_func():
         z = gb_data1.yaw * speed_th  # 根据云台与底盘夹角比例控制Z轴
 
         if (loop_count == True):  # 两种命令间隔发送，在同一循环内发送会造成卡顿与延迟
-            if ui.is_setting == False:
-                send_and_recv(sock_ctrl, "gimbal speed p {0} y {1};".format(data1.mouse_y * 28, data1.mouse_x * 20))
+            send_and_recv(sock_ctrl, "gimbal speed p {0} y {1};".format(data1.mouse_y * 22, data1.mouse_x * 16))
         else:
             send_and_recv(sock_ctrl, "chassis wheel w1 {0} w2 {1} w3 {2} w4 {3};".format(x - y - z, x + y + z, x - y + z, x + y - z))
-        
+        # print(data1.mouse_press)
         # 循环技计数
         loop_count = not loop_count
 
         while is_blocked_man == True:
-            time.sleep(0.1)
+            pass
 # 线程4：UI控制
 def thread4_func():
     pass
-# 线程5：定频发射
+# 线程5：发射
 def thread5_func():
-    global is_blocked_blaster
+    global is_blocked_blaster, is_man_cum
     while True:
+        # data1=queue1.get()
         # 检查是否可以执行
-        while is_blocked_blaster == False:
+        if is_blocked_blaster == False:
             send_and_recv(sock_ctrl, "blaster fire;")
-            time.sleep(0.3)
+            time.sleep(0.2)
+        elif is_man_cum == 2:
+            send_and_recv(sock_ctrl, "blaster fire;")
+            time.sleep(0.1)
         time.sleep(0.1)
 
 # 创建队列
