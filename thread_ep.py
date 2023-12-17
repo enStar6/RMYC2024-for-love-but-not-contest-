@@ -7,7 +7,7 @@ import string
 import serial
 from queue import Queue
 
-time.sleep(10)
+
 # 直连模式下，机器人默认 IP 地址为 192.168.2.1, 控制命令端口号为 40923
 # USB模式下，机器人默认 IP 地址为 192.168.42.2, 控制命令端口号为 40923
 
@@ -26,6 +26,48 @@ def send_and_recv(s, string):
         buf = s.recv(1024)
         print("back: " + buf.decode('utf-8'))
     return buf
+
+def chassis_follow_gimbal(keys, yaw):
+    # 手动操作
+    move_speed = 150  # 行走速度
+    rush_speed = 500  # 疾跑速度
+    speed_tr = move_speed  # 默认平移速度等于行走速度
+    speed_th = 2.5  # 底盘跟随云台速度比例
+    x, y, z = 0, 0, 0  # 底盘运动三维速度 
+    tr_dir = 0  # 底盘坐标系的运动方向
+
+    if 16 in keys:  # shift键
+        speed_tr = rush_speed
+    else:
+        speed_tr = move_speed
+
+    if (87 in keys):  # W键
+        x = speed_tr
+    elif (83 in keys):  # S键
+        x = -1 * speed_tr
+    else:
+        x = 0
+
+    if (68 in keys):  # D键
+        y = speed_tr
+    elif (65 in keys):  # A键
+        y = -1 * speed_tr
+    else:
+        y = 0
+
+    # 将云台坐标系下运动方向转化为底盘坐标系下运动方向
+    if y == 0:
+        tr_dir = yaw
+    elif x == 0:
+        tr_dir = yaw + 90
+    else:
+        tr_dir = yaw + 45
+
+    x *= math.cos(math.radians(tr_dir))  # 根据底盘坐标系运动方向计算X方向速度分量
+    y *= math.sin(math.radians(tr_dir))  # 根据底盘坐标系运动方向计算Y方向速度分量
+    z = yaw * speed_th  # 根据云台与底盘夹角比例控制Z轴
+
+    send_and_recv(sock_ctrl, "chassis wheel w1 {0} w2 {1} w3 {2} w4 {3};".format(x-y-z,x+y+z,x-y+z,x+y-z))
 
 class Data:
     def __init__(self, raw):
@@ -91,6 +133,10 @@ send_recv_lock = threading.Lock()
 blaster_event = threading.Event()
 blaster_event.set()
 
+# 等待EP启动完成
+# for i in range(20,0,-1):
+#     print("open sdk in "+str(i)+" seconds...")
+#     time.sleep(1)
 
 # 与机器人控制命令端口建立 TCP 连接
 sock_ctrl = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -115,15 +161,17 @@ send_and_recv(sock_ctrl, "blaster bead 1;")
 
 ui = UI(0)
 block_skill = 0
-is_blocked_man = False
-is_blocked_data = False
+is_blocked_man_drive_chassis = False
+is_blocked_man_drive_gimbal = False
 is_blocked_blaster = True
-is_man_cum = False
-blaster_flag_lock = threading.Lock()
 
-# 线程1：接收数据
+# 线程1：接收数据、手动控制
 def thread1_func():
-    global block_skill,is_blocked_blaster
+    global block_skill  # 要执行的阻塞程序（技能）
+    global is_blocked_blaster   # 是否禁止发射
+    global is_blocked_man_drive_chassis   # 是否禁止手操底盘
+    global is_blocked_man_drive_gimbal   # 是否禁止手操云台
+    # 初始化4个数据对象
     data1 = Data("game msg push [0, 6, 0, 0, 0, 12, 1, 65];")
     data0 = data1
     gb_data1 = GimbalData("gimbal push attitude 0 0;")
@@ -132,136 +180,69 @@ def thread1_func():
         # 接收信息推送端口
         buf, _ = sock_push.recvfrom(1024)
         buf = buf.decode('utf-8')
+        # 循环内重申两个上一帧数据对象
         data0 = data1
         gb_data0 = gb_data1
-        if buf.startswith("game"):
+        # 解析接收到的数据
+        if buf.startswith("game"):  # 如果接收到的是键值数据
             data1 = Data(buf)
-            # 将数据转化为正负数
+            # 将鼠标移动加速度数据转化为正负数
             data1.mouse_x = data1.mouse_x - 255 if data1.mouse_x > 125 else data1.mouse_x
             data1.mouse_y = data1.mouse_y - 255 if data1.mouse_y > 125 else data1.mouse_y
             # 均值滤波
             data1.mouse_x = (data1.mouse_x + data0.mouse_x) / 2
             data1.mouse_y = (data1.mouse_y + data0.mouse_y) / 2
-            # #按键技能部分
-            if data1.mouse_press == 2:
-                is_man_cum = True
-            if 9 in data1.keys and 9 not in data0.keys:   #Z键    云台旋转180°
+            # 打印键值数据
+            data1.print_data()
+            # 按键技能部分
+            if 9 in data1.keys and 9 not in data0.keys:   #TAB键    云台旋转180°
                 block_skill = 1
             if 70 in data1.keys and 70 not in data0.keys:
-                is_blocked_blaster = not is_blocked_blaster
-                print("blaster: "+str(is_blocked_blaster))
-            if 80 in data1.keys and 80 not in data0.keys:
-                ui.is_setting = not ui.is_setting
-        elif buf.startswith('gimbal'):
+                block_skill = 2 if not block_skill == 2 else 0
+            # if data1.mouse_press == 2 and not data0.mouse_press == 2:   # 单点
+            #     send_and_recv(sock_ctrl, "blaster fire;")
+            # 鼠标控制云台运动
+            if is_blocked_man_drive_gimbal == False:
+                send_and_recv(sock_ctrl, "gimbal speed p {0} y {1};".format(data1.mouse_y * 22, data1.mouse_x * 16))
+        elif buf.startswith('gimbal'):  # 如果接收到的是云台姿态数据
             gb_data1= GimbalData(buf)
-            
-        # 数据进入传输队列
-        queue1.put(data1)
-        queue1.put(gb_data1)
-
-        while is_blocked_data == True:
-            time.sleep(0.1)
+            # 打印云台姿态数据
+            gb_data1.print_data()
+            # 键盘控制底盘及底盘跟随云台
+            if is_blocked_man_drive_chassis == False:
+                chassis_follow_gimbal(data1.keys, gb_data1.yaw)
 # 线程2：阻塞技能
 def thread2_func():
     while True:
         # 获取队列中的数据
-        global block_skill,is_blocked_man,is_blocked_data
-        if block_skill == 1:
-            is_blocked_man = True
-            is_blocked_data = True
+        global block_skill
+        global is_blocked_man_drive_chassis
+        global is_blocked_man_drive_gimbal
+        global is_blocked_blaster
+        if block_skill == 1:    # 暴风赤红经典转身
+            is_blocked_man_drive_gimbal = True
             time.sleep(0.1)
             send_and_recv(sock_ctrl, "gimbal speed p 0 y 450;")
             time.sleep(0.4)
             send_and_recv(sock_ctrl, "gimbal speed p 0 y 0;")
-            is_blocked_man = False
-            is_blocked_data = False
+            is_blocked_man_drive_gimbal = False
             block_skill = 0
+        if block_skill == 2:    # 0.3秒发射
+            while(block_skill == 2):
+                send_and_recv(sock_ctrl, "blaster fire;")
+                time.sleep(0.3)
+
         time.sleep(0.1)
-# 线程手动操作：阻塞技能
-def thread3_func():
-    global is_blocked_man
-    loop_count = True  #初始化计数变量
-    while True:
-        # 获取队列中的数据
-        data1=queue1.get()
-        gb_data1=queue1.get()
-        # 手动操作
-        move_speed = 150  # 行走速度
-        rush_speed = 500  # 疾跑速度
-        speed_tr = move_speed  # 默认平移速度等于行走速度
-        speed_th = 2.5  # 底盘跟随云台速度比例
-        x, y, z = 0, 0, 0  # 底盘运动三维速度 
-        tr_dir = 0  # 底盘坐标系的运动方向
-
-        if 16 in data1.keys:  # shift键
-            speed_tr = rush_speed
-        else:
-            speed_tr = move_speed
-
-        if (87 in data1.keys):  # W键
-            x = speed_tr
-        elif (83 in data1.keys):  # S键
-            x = -1 * speed_tr
-        else:
-            x = 0
-
-        if (68 in data1.keys):  # D键
-            y = speed_tr
-        elif (65 in data1.keys):  # A键
-            y = -1 * speed_tr
-        else:
-            y = 0
-
-        # 将云台坐标系下运动方向转化为底盘坐标系下运动方向
-        if y == 0:
-            tr_dir = gb_data1.yaw
-        elif x == 0:
-            tr_dir = gb_data1.yaw + 90
-        else:
-            tr_dir = gb_data1.yaw + 45
-
-        x *= math.cos(math.radians(tr_dir))  # 根据底盘坐标系运动方向计算X方向速度分量
-        y *= math.sin(math.radians(tr_dir))  # 根据底盘坐标系运动方向计算Y方向速度分量
-        z = gb_data1.yaw * speed_th  # 根据云台与底盘夹角比例控制Z轴
-
-        if (loop_count == True):  # 两种命令间隔发送，在同一循环内发送会造成卡顿与延迟
-            send_and_recv(sock_ctrl, "gimbal speed p {0} y {1};".format(data1.mouse_y * 22, data1.mouse_x * 16))
-        else:
-            send_and_recv(sock_ctrl, "chassis wheel w1 {0} w2 {1} w3 {2} w4 {3};".format(x - y - z, x + y + z, x - y + z, x + y - z))
-        # print(data1.mouse_press)
-        # 循环技计数
-        loop_count = not loop_count
-
-        while is_blocked_man == True:
-            pass
 # 线程4：UI控制
 def thread4_func():
     pass
-# 线程5：发射
-def thread5_func():
-    global is_blocked_blaster, is_man_cum
-    while True:
-        # data1=queue1.get()
-        # 检查是否可以执行
-        if is_blocked_blaster == False:
-            send_and_recv(sock_ctrl, "blaster fire;")
-            time.sleep(0.2)
-        elif is_man_cum == 2:
-            send_and_recv(sock_ctrl, "blaster fire;")
-            time.sleep(0.1)
-        time.sleep(0.1)
 
-# 创建队列
-queue1 = Queue()    # 数据传输（thread1~thread2）
 # 创建线程对象
 thread1 = threading.Thread(target=thread1_func)
 thread2 = threading.Thread(target=thread2_func)
-thread3 = threading.Thread(target=thread3_func)
-thread4 = threading.Thread(target=thread4_func)
-thread5 = threading.Thread(target=thread5_func)    
+thread3 = threading.Thread(target=thread4_func)    
 # 启动线程
 thread1.start()
 thread2.start()
-thread3.start()
-# thread4.start()
-thread5.start()
+# thread3.start()
+
