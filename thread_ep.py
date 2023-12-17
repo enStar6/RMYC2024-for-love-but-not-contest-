@@ -172,10 +172,12 @@ def thread1_func():
     global is_blocked_man_drive_chassis   # 是否禁止手操底盘
     global is_blocked_man_drive_gimbal   # 是否禁止手操云台
     # 初始化4个数据对象
-    data1 = Data("game msg push [0, 6, 0, 0, 0, 12, 1, 65];")
+    data1 = Data("game msg push [0, 6, 0, 0, 0, 12, 0];")
     data0 = data1
     gb_data1 = GimbalData("gimbal push attitude 0 0;")
     gb_data0 = gb_data1
+    lost_msg_count = 0    # 统计没收到信息的次数
+    lost_flag = False   # 防止不断给is_blocked_man_drive_chassis和is_blocked_man_drive_gimbal归零
     while True: 
         # 接收信息推送端口
         buf, _ = sock_push.recvfrom(1024)
@@ -185,6 +187,7 @@ def thread1_func():
         gb_data0 = gb_data1
         # 解析接收到的数据
         if buf.startswith("game"):  # 如果接收到的是键值数据
+            lost_msg_count = 0
             data1 = Data(buf)
             # 将鼠标移动加速度数据转化为正负数
             data1.mouse_x = data1.mouse_x - 255 if data1.mouse_x > 125 else data1.mouse_x
@@ -211,6 +214,18 @@ def thread1_func():
             # 键盘控制底盘及底盘跟随云台
             if is_blocked_man_drive_chassis == False:
                 chassis_follow_gimbal(data1.keys, gb_data1.yaw)
+        # 每次循环都递增，若收到键值信息会归零
+        lost_msg_count += 1 if lost_msg_count < 30 else 0
+        # 若连续3次未收到键值信息，则锁定云台、底盘的手操
+        if lost_msg_count > 3:
+            is_blocked_man_drive_chassis, is_blocked_man_drive_gimbal = True, True
+            lost_flag = True
+        elif lost_flag == True:     # 若收到键值信息且lost_flag为True（已经锁定底盘、云台），则解锁，重置lost_flag
+            is_blocked_man_drive_chassis, is_blocked_man_drive_gimbal = False, False
+            lost_flag = False
+        if lost_msg_count > 3:     # 若连续三次未收到键值信息，则停止云台、底盘运动
+            send_and_recv(sock_ctrl, "gimbal speed p 0 y 0;")
+            send_and_recv(sock_ctrl, "chassis wheel w1 0 w2 0 w3 0 w4 0;")
 # 线程2：阻塞技能
 def thread2_func():
     while True:
@@ -233,14 +248,14 @@ def thread2_func():
                 time.sleep(0.3)
 
         time.sleep(0.1)
-# 线程4：UI控制
-def thread4_func():
+# 线程3：UI控制
+def thread3_func():
     pass
 
 # 创建线程对象
 thread1 = threading.Thread(target=thread1_func)
 thread2 = threading.Thread(target=thread2_func)
-thread3 = threading.Thread(target=thread4_func)    
+thread3 = threading.Thread(target=thread3_func)    
 # 启动线程
 thread1.start()
 thread2.start()
